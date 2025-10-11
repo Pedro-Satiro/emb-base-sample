@@ -49,7 +49,7 @@ static void run_blink(void) {
     k_msleep(BLINK_T);
 }
 
-static inline void pwm_gen(void) {
+static void run_fade(void) {
     gpio_pin_set_dt(&led, 1);
     if (st.duty > 0) {
         k_busy_wait(st.duty);
@@ -60,10 +60,6 @@ static inline void pwm_gen(void) {
     if (off_us > 0) {
         k_busy_wait(off_us);
     }
-}
-
-static void run_fade(void) {
-    pwm_gen();
     
     int64_t now = k_uptime_get();
     if (now - st.ts >= LOG_T) {
