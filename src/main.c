@@ -1,152 +1,179 @@
 #include <zephyr/kernel.h>
-#include <zephyr/drivers/gpio.h>
-#include <zephyr/drivers/uart.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/random/random.h>
 
-LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(sensors, LOG_LEVEL_INF);
 
-static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
-static const struct gpio_dt_spec btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
-static const struct device* const uart = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
-static struct gpio_callback btn_cb;
+#define TEMP_MIN            
+#define TEMP_MAX            30
+#define HUMIDITY_MIN        40
+#define HUMIDITY_MAX        70
 
-#define STEPS           50U
-#define PWM_T           20000U
-#define BLINK_T         500U
-#define FADE_T          25U
-#define STEP_US         (PWM_T / STEPS)
-#define LOG_T           100U 
+#define STACK_SIZE          1024
+#define PRIORITY            5
+#define QUEUE_SIZE          10
+
+#define TEMP_INTERVAL_MS    800
+#define HUMIDITY_INTERVAL_MS 600
 
 typedef enum {
-    BLINK = 0,
-    FADE
-} mode_t;
+    SENSOR_HUMIDITY = 0,
+    SENSOR_TEMPERATURE
+} sensor_type_t;
 
-static struct ctrl {
-    volatile mode_t mode;
-    uint32_t duty;
-    uint8_t dir;
-    int64_t ts;
-    bool on;
-} st = {
-    .mode = BLINK,
-    .dir = 1U,
-    .on = false,
-    .duty = 0,
-    .ts = 0
-};
+typedef struct {
+    sensor_type_t type;
+    union {
+        uint8_t humidity;
+        int8_t temperature;
+    } value;
+    int64_t timestamp;
+} sensor_msg_t;
 
-static void run_blink(void) {
-    gpio_pin_toggle_dt(&led);
-    st.on = !st.on;
-    
-    int64_t now = k_uptime_get();
-    if (now - st.ts >= LOG_T) {
-        LOG_INF("Blink Mode - LED: %s", st.on ? "ON" : "OFF");
-        st.ts = now;
-    }
+K_MSGQ_DEFINE(input_queue, sizeof(sensor_msg_t), QUEUE_SIZE, 4);
+K_MSGQ_DEFINE(output_queue, sizeof(sensor_msg_t), QUEUE_SIZE, 4);
 
-    k_msleep(BLINK_T);
-}
-
-static void run_fade(void) {
-    gpio_pin_set_dt(&led, 1);
-    if (st.duty > 0) {
-        k_busy_wait(st.duty);
-    }
+static sensor_msg_t generate_sensor_reading(sensor_type_t type) {
+    sensor_msg_t msg;
+    msg.type = type;
+    msg.timestamp = k_uptime_get();
     
-    gpio_pin_set_dt(&led, 0);
-    uint32_t off_us = PWM_T - st.duty;
-    if (off_us > 0) {
-        k_busy_wait(off_us);
-    }
-    
-    int64_t now = k_uptime_get();
-    if (now - st.ts >= LOG_T) {
-        LOG_INF("Fade Mode: Brightness at ~%d%%", 
-            (100 * st.duty) / PWM_T);
-        st.ts = now;
-    }
-    
-    if (st.dir) {
-        st.duty += STEP_US;
-        if (st.duty >= PWM_T) {
-            st.duty = PWM_T;
-            st.dir = 0U;
-        }
+    if (type == SENSOR_HUMIDITY) {
+        msg.value.humidity = sys_rand32_get() % 100;
     } else {
-        if (st.duty <= STEP_US) {
-            st.duty = 0;
-            st.dir = 1U;
-        } else {
-            st.duty -= STEP_US;
-        }
+        msg.value.temperature = (sys_rand32_get() % 50) + 10;
     }
-
-    k_msleep(FADE_T);
-}
-
-static void toggle(void) {
-    if (st.mode == BLINK) {
-        st.mode = FADE;
-        st.duty = 0;
-        st.dir = 1U;
-        LOG_INF("-------------------------------------");
-        LOG_INF("Mode changed to: FADE");
-        LOG_INF("-------------------------------------");
-    } else {
-        st.mode = BLINK;
-        LOG_INF("-------------------------------------");
-        LOG_INF("Switching to BLINK mode in 3 seconds...");
-        LOG_INF("-------------------------------------");
-        k_msleep(3000);
-        gpio_pin_set_dt(&led, 0);
-        LOG_INF("-------------------------------------");
-        LOG_INF("Mode changed to: BLINK");
-        LOG_INF("-------------------------------------");
-    }
-}
-
-void btn_isr(const struct device* dev, struct gpio_callback* cb, uint32_t pins) {
-    ARG_UNUSED(dev);
-    ARG_UNUSED(cb);
-    ARG_UNUSED(pins);
     
-    toggle();
+    return msg;
 }
 
-int main(void) {
-    unsigned char c;
+static void temperature_producer_thread(void *p1, void *p2, void *p3) {
+    ARG_UNUSED(p1);
+    ARG_UNUSED(p2);
+    ARG_UNUSED(p3);
     
-    gpio_pin_configure_dt(&led, GPIO_OUTPUT_INACTIVE);
-    gpio_pin_configure_dt(&btn, GPIO_INPUT);
-    gpio_pin_interrupt_configure_dt(&btn, GPIO_INT_EDGE_TO_ACTIVE);
-    gpio_init_callback(&btn_cb, btn_isr, BIT(btn.pin));
-    gpio_add_callback(btn.port, &btn_cb);
-
-    LOG_INF("=== LED Control Application ===");
-    LOG_INF("Modes: BLINK <-> FADE (PWM)");
-    LOG_INF("Current mode: %s", st.mode == BLINK ? "BLINK" : "FADE");
-    LOG_INF("Press ENTER or button to switch modes");
-    LOG_INF("===============================================");
+    LOG_INF("Temperature Producer: Started");
     
     while (1) {
-        if (!uart_poll_in(uart, &c) && 
-            (c == '\n' || c == '\r')) {
-            toggle();
+        sensor_msg_t msg = generate_sensor_reading(SENSOR_TEMPERATURE);
+        
+        int ret = k_msgq_put(&input_queue, &msg, K_NO_WAIT);
+        if (ret != 0) {
+            LOG_WRN("Temperature Producer: Queue full, dropping reading");
         }
         
-        switch (st.mode) {
-            case FADE:
-                run_fade();
-                break;
-            case BLINK:
-                run_blink();
-                break;
-        }
+        k_msleep(TEMP_INTERVAL_MS);
     }
-    return 0;
 }
 
-// west build -b mps2/an385 -d build
-// timeout 20s west build -t run
+static void humidity_producer_thread(void *p1, void *p2, void *p3) {
+    ARG_UNUSED(p1);
+    ARG_UNUSED(p2);
+    ARG_UNUSED(p3);
+    
+    LOG_INF("Humidity Producer: Started");
+    
+    while (1) {
+        sensor_msg_t msg = generate_sensor_reading(SENSOR_HUMIDITY);
+        
+        int ret = k_msgq_put(&input_queue, &msg, K_NO_WAIT);
+        if (ret != 0) {
+            LOG_WRN("Humidity Producer: Queue full, dropping reading");
+        }
+        
+        k_msleep(HUMIDITY_INTERVAL_MS);
+    }
+}
+static bool validate_sensor_data(const sensor_msg_t *msg) {
+    switch (msg->type) {
+        case SENSOR_TEMPERATURE:
+            return (msg->value.temperature >= TEMP_MIN && 
+                    msg->value.temperature <= TEMP_MAX);
+        case SENSOR_HUMIDITY:
+            return (msg->value.humidity >= HUMIDITY_MIN && 
+                    msg->value.humidity <= HUMIDITY_MAX);
+        default:
+            return false;
+    }
+}
+
+static void log_invalid_data(const sensor_msg_t *msg) {
+    if (msg->type == SENSOR_TEMPERATURE) {
+        LOG_ERR("INVALID Temperature: %d°C (valid range: %d-%d°C)", 
+                msg->value.temperature, TEMP_MIN, TEMP_MAX);
+    } else {
+        LOG_ERR("INVALID Humidity: %d%% (valid range: %d-%d%%)", 
+                msg->value.humidity, HUMIDITY_MIN, HUMIDITY_MAX);
+    }
+}
+
+static void filter_thread(void *p1, void *p2, void *p3) {
+    ARG_UNUSED(p1);
+    ARG_UNUSED(p2);
+    ARG_UNUSED(p3);
+    
+    LOG_INF("Filter: Started");
+    sensor_msg_t msg;
+    
+    while (1) {
+        if (k_msgq_get(&input_queue, &msg, K_FOREVER) == 0) {
+            if (validate_sensor_data(&msg)) {
+                int ret = k_msgq_put(&output_queue, &msg, K_NO_WAIT);
+                if (ret != 0) {
+                    LOG_WRN("Filter: Output queue full, dropping valid data");
+                }
+            } else {
+                log_invalid_data(&msg);
+            }
+        }
+    }
+}
+
+static void consumer_thread(void *p1, void *p2, void *p3) {
+    ARG_UNUSED(p1);
+    ARG_UNUSED(p2);
+    ARG_UNUSED(p3);
+    
+    LOG_INF("Consumer: Started");
+    sensor_msg_t msg;
+    
+    while (1) {
+        if (k_msgq_get(&output_queue, &msg, K_FOREVER) == 0) {
+            if (msg.type == SENSOR_TEMPERATURE) {
+                LOG_INF("✓ VALID Temperature: %d°C [ts: %lld]", 
+                        msg.value.temperature, msg.timestamp);
+            } else {
+                LOG_INF("✓ VALID Humidity: %d%% [ts: %lld]", 
+                        msg.value.humidity, msg.timestamp);
+            }
+        }
+    }
+}
+
+K_THREAD_DEFINE(temp_producer, STACK_SIZE, temperature_producer_thread, 
+                NULL, NULL, NULL, PRIORITY, 0, 0);
+
+K_THREAD_DEFINE(humidity_producer, STACK_SIZE, humidity_producer_thread, 
+                NULL, NULL, NULL, PRIORITY, 0, 0);
+
+K_THREAD_DEFINE(filter, STACK_SIZE, filter_thread, 
+                NULL, NULL, NULL, PRIORITY + 1, 0, 0);
+
+K_THREAD_DEFINE(consumer, STACK_SIZE, consumer_thread, 
+                NULL, NULL, NULL, PRIORITY + 2, 0, 0);
+
+int main(void) {
+    LOG_INF("=== Sensor Data Processing System ===");
+    LOG_INF("Temperature range: %d-%d°C", TEMP_MIN, TEMP_MAX);
+    LOG_INF("Humidity range: %d-%d%%", HUMIDITY_MIN, HUMIDITY_MAX);
+    LOG_INF("==========================================");
+    
+    while (1) {
+        k_msleep(5000);
+        LOG_INF("System running - Queues: Input[%d] Output[%d]", 
+                k_msgq_num_used_get(&input_queue),
+                k_msgq_num_used_get(&output_queue));
+    }
+    
+    return 0;
+}
