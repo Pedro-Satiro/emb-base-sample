@@ -1,109 +1,125 @@
+/* Minimal Wi-Fi connect example for Zephyr
+ * Replaces the previous mixed SNTP/ZBus code with a focused Wi-Fi connect demo.
+ */
+
+#include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/random/random.h>
+#include <zephyr/net/net_event.h>
+#include <zephyr/net/net_if.h>
+#include <zephyr/net/socket.h>
+#include <zephyr/net/wifi_mgmt.h>
+#include <zephyr/net/dns_resolve.h>
+#include <zephyr/net/net_mgmt.h>
 
-LOG_MODULE_REGISTER(sensors, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(wifi, LOG_LEVEL_INF);
 
-#define TEMP_MIN            
-#define TEMP_MAX            30
-#define HUMIDITY_MIN        40
-#define HUMIDITY_MAX        70
+static struct k_sem got_ip_sem;
+static struct net_mgmt_event_callback ip_cb;
+static bool is_wifi_connected = false;
 
-#define STACK_SIZE          1024
-#define PRIORITY            5
-#define QUEUE_SIZE          10
+static void ip_event_handler(struct net_mgmt_event_callback *cb, uint64_t mgmt_event,
+                             struct net_if *iface)
+{
+    if (mgmt_event == NET_EVENT_IPV4_ADDR_ADD) {
+        char ip[NET_IPV4_ADDR_LEN];
+        const struct net_if_config *cfg = net_if_get_config(iface);
 
-#define TEMP_INTERVAL_MS    800
-#define HUMIDITY_INTERVAL_MS 600
-
-typedef enum {
-    SENSOR_HUMIDITY = 0,
-    SENSOR_TEMPERATURE
-} sensor_type_t;
-
-typedef struct {
-    sensor_type_t type;
-    union {
-        uint8_t humidity;
-        int8_t temperature;
-    } value;
-    int64_t timestamp;
-} sensor_msg_t;
-
-K_MSGQ_DEFINE(input_queue, sizeof(sensor_msg_t), QUEUE_SIZE, 4);
-K_MSGQ_DEFINE(output_queue, sizeof(sensor_msg_t), QUEUE_SIZE, 4);
-
-static sensor_msg_t generate_sensor_reading(sensor_type_t type) {
-    sensor_msg_t msg;
-    msg.type = type;
-    msg.timestamp = k_uptime_get();
-    
-    if (type == SENSOR_HUMIDITY) {
-        msg.value.humidity = sys_rand32_get() % 100;
-    } else {
-        msg.value.temperature = (sys_rand32_get() % 50) + 10;
-    }
-    
-    return msg;
-}
-
-static void temperature_producer_thread(void *p1, void *p2, void *p3) {
-    ARG_UNUSED(p1);
-    ARG_UNUSED(p2);
-    ARG_UNUSED(p3);
-    
-    LOG_INF("Temperature Producer: Started");
-    
-    while (1) {
-        sensor_msg_t msg = generate_sensor_reading(SENSOR_TEMPERATURE);
-        
-        int ret = k_msgq_put(&input_queue, &msg, K_NO_WAIT);
-        if (ret != 0) {
-            LOG_WRN("Temperature Producer: Queue full, dropping reading");
+        if (cfg && cfg->ip.ipv4) {
+            net_addr_ntop(AF_INET, &cfg->ip.ipv4->unicast[0].ipv4.address.in_addr, ip,
+                          sizeof(ip));
+            LOG_INF("DHCP OK: %s", ip);
+            is_wifi_connected = true;
+            k_sem_give(&got_ip_sem);
         }
-        
-        k_msleep(TEMP_INTERVAL_MS);
     }
 }
 
-static void humidity_producer_thread(void *p1, void *p2, void *p3) {
-    ARG_UNUSED(p1);
-    ARG_UNUSED(p2);
-    ARG_UNUSED(p3);
-    
-    LOG_INF("Humidity Producer: Started");
-    
-    while (1) {
-        sensor_msg_t msg = generate_sensor_reading(SENSOR_HUMIDITY);
-        
-        int ret = k_msgq_put(&input_queue, &msg, K_NO_WAIT);
-        if (ret != 0) {
-            LOG_WRN("Humidity Producer: Queue full, dropping reading");
-        }
-        
-        k_msleep(HUMIDITY_INTERVAL_MS);
+static int wifi_connect_now(const char *ssid, const char *psk)
+{
+    struct net_if *iface = net_if_get_default();
+    struct wifi_connect_req_params p = {0};
+
+    p.ssid = ssid;
+    p.ssid_length = strlen(ssid);
+    p.psk = psk;
+    p.psk_length = strlen(psk);
+    p.security = WIFI_SECURITY_TYPE_PSK;
+    p.channel = WIFI_CHANNEL_ANY;
+
+    int ret = net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &p, sizeof(p));
+    if (ret) {
+        LOG_ERR("Failed NET_REQUEST_WIFI_CONNECT (%d)", ret);
+        return ret;
     }
-}
-static bool validate_sensor_data(const sensor_msg_t *msg) {
-    switch (msg->type) {
-        case SENSOR_TEMPERATURE:
-            return (msg->value.temperature >= TEMP_MIN && 
-                    msg->value.temperature <= TEMP_MAX);
-        case SENSOR_HUMIDITY:
-            return (msg->value.humidity >= HUMIDITY_MIN && 
-                    msg->value.humidity <= HUMIDITY_MAX);
-        default:
-            return false;
-    }
+
+    LOG_INF("Connecting on AP \"%s\" ...", ssid);
+    return 0;
 }
 
-static void log_invalid_data(const sensor_msg_t *msg) {
-    if (msg->type == SENSOR_TEMPERATURE) {
-        LOG_ERR("INVALID Temperature: %d°C (valid range: %d-%d°C)", 
-                msg->value.temperature, TEMP_MIN, TEMP_MAX);
+int app_auto_init(void)
+{
+    LOG_INF("Starting Wi-Fi Connect");
+
+    k_sem_init(&got_ip_sem, 0, 1);
+    net_mgmt_init_event_callback(&ip_cb, ip_event_handler, NET_EVENT_IPV4_ADDR_ADD);
+    net_mgmt_add_event_callback(&ip_cb);
+
+    if (wifi_connect_now(CONFIG_WIFI_SSID, CONFIG_WIFI_PASSWD) != 0) {
+        return -EIO;
+    }
+
+    if (k_sem_take(&got_ip_sem, K_SECONDS(30)) != 0) {
+        LOG_ERR("DHCP Timeout");
+        return -ETIMEDOUT;
+    }
+
+    /* Quick DNS test to verify network/DNS */
+    struct zsock_addrinfo hints = {0}, *res = NULL;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    const char *hostname_test = "google.com";
+
+    int ret = zsock_getaddrinfo(hostname_test, "80", &hints, &res);
+    if (ret) {
+        LOG_ERR("DNS failed (%d)", ret);
+        return -1;
     } else {
-        LOG_ERR("INVALID Humidity: %d%% (valid range: %d-%d%%)", 
-                msg->value.humidity, HUMIDITY_MIN, HUMIDITY_MAX);
+        char ipbuf[NET_IPV4_ADDR_LEN];
+        struct sockaddr_in *a = (struct sockaddr_in *)res->ai_addr;
+
+        net_addr_ntop(AF_INET, &a->sin_addr, ipbuf, sizeof(ipbuf));
+
+        LOG_INF("DNS OK: %s -> %s", ipbuf, hostname_test);
+        zsock_freeaddrinfo(res);
+    }
+
+    is_wifi_connected = true;
+    return 0;
+}
+
+void main(void)
+{
+    int ret;
+
+    LOG_INF("=== WiFi connect example ===");
+    LOG_INF("SSID: %s", CONFIG_WIFI_SSID);
+
+    ret = app_auto_init();
+    if (ret) {
+        LOG_ERR("app_auto_init failed: %d", ret);
+    } else {
+        LOG_INF("WiFi connected and DNS OK");
+    }
+
+    while (1) {
+        if (is_wifi_connected) {
+            LOG_INF("WiFi: connected");
+        } else {
+            LOG_INF("WiFi: disconnected");
+        }
+        k_sleep(K_SECONDS(10));
     }
 }
 

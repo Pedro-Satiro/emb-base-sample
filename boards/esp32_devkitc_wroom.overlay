@@ -1,0 +1,19 @@
+/*
+ * ESP32 DevKit v1 overlay for SNTP time synchronization project
+ */
+
+/ {
+	chosen {
+		zephyr,console = &uart0;
+		zephyr,shell-uart = &uart0;
+	};
+};
+
+&wifi {
+	status = "okay";
+};
+
+&uart0 {
+	status = "okay";
+	current-speed = <115200>;
+};

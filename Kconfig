@@ -1,3 +1,37 @@
+# SNTP Time Synchronization Configuration
+
+config SNTP_SERVER
+    string "SNTP Server Address"
+    default "pool.ntp.org"
+    help
+      Hostname or IP address of the SNTP server to synchronize with.
+      Default is pool.ntp.org which provides a pool of NTP servers.
+
+config WIFI_SSID
+    string "WiFi SSID"
+    default "MyWiFi"
+    help
+      SSID of the WiFi network to connect to.
+
+config WIFI_PASSWORD
+    string "WiFi Password"
+    default "password123"
+    help
+      Password for the WiFi network.
+
+# Additional networking configurations
+config WIFI_CONNECT_TIMEOUT
+    int "WiFi connection timeout (ms)"
+    default 30000
+    help
+      Maximum time to wait for WiFi connection in milliseconds.
+
+config SNTP_SYNC_INTERVAL
+    int "SNTP sync interval (seconds)"
+    default 60
+    help
+      Interval between SNTP synchronization requests in seconds.
+
 menu "Zephyr"
 source "Kconfig.zephyr"
 endmenu
