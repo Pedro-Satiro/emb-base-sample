@@ -14,6 +14,8 @@
 #include <zephyr/zbus/zbus.h>
 
 // tentei fazer com  uma rasp zero mas nao tava conseguindo, acabei optando pela esp 32 devkit
+// west packages pip --install
+// west blobs fetch hal_espressif
 
 
 LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
