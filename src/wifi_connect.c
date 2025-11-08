@@ -12,8 +12,7 @@
 
 static struct k_sem got_ip_sem;
 static struct net_mgmt_event_callback ip_cb;
-/* Internal connectivity flag - do not export global variable.
- * Use wifi_is_connected() to query state. */
+
 static bool is_wifi_connected = false;
 
 LOG_MODULE_REGISTER(wifi, LOG_LEVEL_INF);
