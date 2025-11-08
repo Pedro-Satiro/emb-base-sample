@@ -1,195 +1,262 @@
-/* Minimal Wi-Fi connect example for Zephyr
- * Replaces the previous mixed SNTP/ZBus code with a focused Wi-Fi connect demo.
- */
-
+#include "zephyr/net/net_ip.h"
+#include "zephyr/net/socket_service.h"
+#include <stdint.h>
 #include <string.h>
+#include <time.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/net/net_event.h>
-#include <zephyr/net/net_if.h>
+#include <zephyr/net/sntp.h>
 #include <zephyr/net/socket.h>
-#include <zephyr/net/wifi_mgmt.h>
-#include <zephyr/net/dns_resolve.h>
-#include <zephyr/net/net_mgmt.h>
+#include <zephyr/sys/clock.h>
+#include <zephyr/sys/printk.h>
+#include <zephyr/sys/timeutil.h>
+#include <zephyr/toolchain.h>
+#include <zephyr/zbus/zbus.h>
 
-LOG_MODULE_REGISTER(wifi, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 
-static struct k_sem got_ip_sem;
-static struct net_mgmt_event_callback ip_cb;
-static bool is_wifi_connected = false;
+#include "wifi_connect.h"
 
-static void ip_event_handler(struct net_mgmt_event_callback *cb, uint64_t mgmt_event,
-                             struct net_if *iface)
+struct data {
+	struct tm timestamp;
+};
+
+struct endpoint {
+	struct sockaddr addr;
+	socklen_t len;
+};
+
+ZBUS_CHAN_DEFINE(time_channel, struct data, NULL, NULL, ZBUS_OBSERVERS(log_subs, app_subs),
+		 ZBUS_MSG_INIT(.timestamp = 0));
+
+K_THREAD_STACK_DEFINE(thread_sntp_stack, 1024);
+K_THREAD_STACK_DEFINE(thread_logger_stack, 1024);
+K_THREAD_STACK_DEFINE(thread_app_stack, 1024);
+
+static struct k_thread thread_sntp_data;
+static struct k_thread thread_logger_data;
+static struct k_thread thread_app_data;
+
+static struct endpoint sntp_endpoint;
+static struct sntp_time s_time;
+static K_SEM_DEFINE(sntp_async_received, 0, 1);
+static void sntp_service_handler(struct net_socket_service_event *pev);
+
+NET_SOCKET_SERVICE_SYNC_DEFINE_STATIC(service_sntp_async, sntp_service_handler, 1);
+
+SYS_INIT(app_auto_init, APPLICATION, 50);
+
+static void sntp_service_handler(struct net_socket_service_event *pev)
 {
-    if (mgmt_event == NET_EVENT_IPV4_ADDR_ADD) {
-        char ip[NET_IPV4_ADDR_LEN];
-        const struct net_if_config *cfg = net_if_get_config(iface);
+	int error;
 
-        if (cfg && cfg->ip.ipv4) {
-            net_addr_ntop(AF_INET, &cfg->ip.ipv4->unicast[0].ipv4.address.in_addr, ip,
-                          sizeof(ip));
-            LOG_INF("DHCP OK: %s", ip);
-            is_wifi_connected = true;
-            k_sem_give(&got_ip_sem);
-        }
-    }
+	error = sntp_read_async(pev, &s_time);
+	if (error) {
+		LOG_ERR("[SNTP] failed to read SNTP response (%d)", error);
+		return;
+	}
+
+	k_sem_give(&sntp_async_received);
 }
 
-static int wifi_connect_now(const char *ssid, const char *psk)
+void logger_thread(void *arg1, void *arg2, void *arg3)
 {
-    struct net_if *iface = net_if_get_default();
-    struct wifi_connect_req_params p = {0};
+	int error;
+	char date_time[32] = {0};
 
-    p.ssid = ssid;
-    p.ssid_length = strlen(ssid);
-    p.psk = psk;
-    p.psk_length = strlen(psk);
-    p.security = WIFI_SECURITY_TYPE_PSK;
-    p.channel = WIFI_CHANNEL_ANY;
+	static struct tm internal_clock = {0};
+	const struct zbus_channel *ch;
+	struct data msg;
 
-    int ret = net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &p, sizeof(p));
-    if (ret) {
-        LOG_ERR("Failed NET_REQUEST_WIFI_CONNECT (%d)", ret);
-        return ret;
-    }
+	LOG_INF("[LOGGER] Starting service");
 
-    LOG_INF("Connecting on AP \"%s\" ...", ssid);
-    return 0;
+	while (true) {
+		error = zbus_sub_wait(&log_subs, &ch, K_FOREVER);
+		if (error) {
+			LOG_WRN("[LOGGER] error while waiting channel notification: %d", error);
+			continue;
+		}
+
+		error = zbus_chan_read(ch, &msg, K_FOREVER);
+		if (error) {
+			LOG_WRN("[LOGGER] error while reading channel msg: %d", error);
+			continue;
+		}
+
+		internal_clock = msg.timestamp;
+
+		strftime(date_time, 30, "%a %Y-%m-%d %H:%M:%S %Z", &internal_clock);
+		LOG_INF("[LOGGER] Internal clock updated: %s", date_time);
+	}
 }
 
-int app_auto_init(void)
+void app_thread(void *arg1, void *arg2, void *arg3)
 {
-    LOG_INF("Starting Wi-Fi Connect");
+	int error;
+	bool init_ts = false;
+	char date_time[32] = {0};
+	char format[64];
+	snprintf(format, sizeof(format), "%%a %%Y-%%m-%%d %%H:%%M:%%S %%Z%+d", CONFIG_LOCAL_TIME);
 
-    k_sem_init(&got_ip_sem, 0, 1);
-    net_mgmt_init_event_callback(&ip_cb, ip_event_handler, NET_EVENT_IPV4_ADDR_ADD);
-    net_mgmt_add_event_callback(&ip_cb);
+	const struct zbus_channel *ch;
+	static struct tm last_timestamp = {0};
+	struct data msg;
 
-    if (wifi_connect_now(CONFIG_WIFI_SSID, CONFIG_WIFI_PASSWD) != 0) {
-        return -EIO;
-    }
+	LOG_INF("[APP] Starting service");
 
-    if (k_sem_take(&got_ip_sem, K_SECONDS(30)) != 0) {
-        LOG_ERR("DHCP Timeout");
-        return -ETIMEDOUT;
-    }
+	while (true) {
+		error = zbus_sub_wait(&app_subs, &ch, K_FOREVER);
+		if (error) {
+			LOG_WRN("[APP] error while waiting channel notification: %d", error);
+			continue;
+		}
 
-    /* Quick DNS test to verify network/DNS */
-    struct zsock_addrinfo hints = {0}, *res = NULL;
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
+		error = zbus_chan_read(ch, &msg, K_FOREVER);
+		if (error) {
+			LOG_WRN("[APP] error while reading channel msg: %d", error);
+			continue;
+		}
 
-    const char *hostname_test = "google.com";
+		strftime(date_time, 30, format, &last_timestamp);
+		LOG_DBG("[APP] Last execution time: %s", date_time);
 
-    int ret = zsock_getaddrinfo(hostname_test, "80", &hints, &res);
-    if (ret) {
-        LOG_ERR("DNS failed (%d)", ret);
-        return -1;
-    } else {
-        char ipbuf[NET_IPV4_ADDR_LEN];
-        struct sockaddr_in *a = (struct sockaddr_in *)res->ai_addr;
+		strftime(date_time, 30, format, &msg.timestamp);
+		LOG_DBG("[APP] Now execution time: %s", date_time);
 
-        net_addr_ntop(AF_INET, &a->sin_addr, ipbuf, sizeof(ipbuf));
+		if (!init_ts) {
+			last_timestamp = msg.timestamp;
+			init_ts = true;
+		}
 
-        LOG_INF("DNS OK: %s -> %s", ipbuf, hostname_test);
-        zsock_freeaddrinfo(res);
-    }
+		int64_t ta = timeutil_timegm64(&last_timestamp);
+		int64_t tb = timeutil_timegm64(&msg.timestamp);
+		int64_t dt = tb - ta;
 
-    is_wifi_connected = true;
-    return 0;
+		LOG_INF("[APP] Time execution interval: %" PRId64 "s", dt);
+
+		last_timestamp = msg.timestamp;
+	}
 }
 
-void main(void)
+void sntp_thread(void *arg1, void *arg2, void *arg3)
 {
-    int ret;
+	ARG_UNUSED(arg2);
+	ARG_UNUSED(arg3);
 
-    LOG_INF("=== WiFi connect example ===");
-    LOG_INF("SSID: %s", CONFIG_WIFI_SSID);
+	char format[64];
+	snprintf(format, sizeof(format), "%%a %%Y-%%m-%%d %%H:%%M:%%S %%Z%+d", CONFIG_LOCAL_TIME);
 
-    ret = app_auto_init();
-    if (ret) {
-        LOG_ERR("app_auto_init failed: %d", ret);
-    } else {
-        LOG_INF("WiFi connected and DNS OK");
-    }
+	struct endpoint *sntp_endpoint = (struct endpoint *)arg1;
+	struct sntp_ctx ctx;
+	int error;
 
-    while (1) {
-        if (is_wifi_connected) {
-            LOG_INF("WiFi: connected");
-        } else {
-            LOG_INF("WiFi: disconnected");
-        }
-        k_sleep(K_SECONDS(10));
-    }
+	error = sntp_init_async(&ctx, &sntp_endpoint->addr, sntp_endpoint->len,
+				&service_sntp_async);
+	if (error) {
+		LOG_ERR("Failed to init SNTP, ctx: %d", error);
+		sntp_close(&ctx);
+
+		return;
+	}
+
+	LOG_INF("Starting SNTP Service");
+
+	while (true) {
+		struct tm time_utc;
+
+		k_sem_reset(&sntp_async_received);
+		error = sntp_send_async(&ctx);
+
+		if (error) {
+			LOG_WRN("[SNTP] Failed to send SNTP query (%d)", error);
+			continue;
+		}
+
+		error = k_sem_take(&sntp_async_received, K_MSEC(1000));
+		if (error) {
+			LOG_WRN("[SNTP] response timed out (%d)", error);
+			continue;
+		}
+
+		const struct timespec ts = {
+			.tv_sec = s_time.seconds,
+			.tv_nsec = (long)((((uint64_t)s_time.fraction) * 1000000000ULL) >> 32)};
+
+		sys_clock_settime(CLOCK_REALTIME, &ts);
+
+		uint64_t local_sec = s_time.seconds + (CONFIG_LOCAL_TIME * 3600);
+		gmtime_r(&local_sec, &time_utc);
+
+		char date_time[32];
+		strftime(date_time, 30, format, &time_utc);
+
+		LOG_INF("[SNTP] Localtime updated: %s", date_time);
+
+		struct data msg = {.timestamp = time_utc};
+		error = zbus_chan_pub(&time_channel, &msg, K_NO_WAIT);
+		if (error) {
+			LOG_WRN("[SNTP] failed to publish in channel");
+		}
+
+		int sleep_time = (k_cycle_get_32() % 5000) + 500;
+
+		k_sleep(K_MSEC(sleep_time));
+	}
+
+	sntp_close_async(&service_sntp_async);
+	sntp_close(&ctx);
 }
 
-static void filter_thread(void *p1, void *p2, void *p3) {
-    ARG_UNUSED(p1);
-    ARG_UNUSED(p2);
-    ARG_UNUSED(p3);
-    
-    LOG_INF("Filter: Started");
-    sensor_msg_t msg;
-    
-    while (1) {
-        if (k_msgq_get(&input_queue, &msg, K_FOREVER) == 0) {
-            if (validate_sensor_data(&msg)) {
-                int ret = k_msgq_put(&output_queue, &msg, K_NO_WAIT);
-                if (ret != 0) {
-                    LOG_WRN("Filter: Output queue full, dropping valid data");
-                }
-            } else {
-                log_invalid_data(&msg);
-            }
-        }
-    }
-}
+ZBUS_SUBSCRIBER_DEFINE(app_subs, 4);
+ZBUS_SUBSCRIBER_DEFINE(log_subs, 4);
 
-static void consumer_thread(void *p1, void *p2, void *p3) {
-    ARG_UNUSED(p1);
-    ARG_UNUSED(p2);
-    ARG_UNUSED(p3);
-    
-    LOG_INF("Consumer: Started");
-    sensor_msg_t msg;
-    
-    while (1) {
-        if (k_msgq_get(&output_queue, &msg, K_FOREVER) == 0) {
-            if (msg.type == SENSOR_TEMPERATURE) {
-                LOG_INF("✓ VALID Temperature: %d°C [ts: %lld]", 
-                        msg.value.temperature, msg.timestamp);
-            } else {
-                LOG_INF("✓ VALID Humidity: %d%% [ts: %lld]", 
-                        msg.value.humidity, msg.timestamp);
-            }
-        }
-    }
-}
+int main(void)
+{
+	if (!wifi_connected()) {
+		LOG_INF("Unable to connect to the WIFI.");
+		return -1;
+	}
 
-K_THREAD_DEFINE(temp_producer, STACK_SIZE, temperature_producer_thread, 
-                NULL, NULL, NULL, PRIORITY, 0, 0);
+	int error;
+	char ipbuf[NET_IPV4_ADDR_LEN];
 
-K_THREAD_DEFINE(humidity_producer, STACK_SIZE, humidity_producer_thread, 
-                NULL, NULL, NULL, PRIORITY, 0, 0);
+	struct zsock_addrinfo hints;
+	struct zsock_addrinfo *res;
 
-K_THREAD_DEFINE(filter, STACK_SIZE, filter_thread, 
-                NULL, NULL, NULL, PRIORITY + 1, 0, 0);
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_DGRAM;
 
-K_THREAD_DEFINE(consumer, STACK_SIZE, consumer_thread, 
-                NULL, NULL, NULL, PRIORITY + 2, 0, 0);
+	LOG_INF("Starting system");
 
-int main(void) {
-    LOG_INF("=== Sensor Data Processing System ===");
-    LOG_INF("Temperature range: %d-%d°C", TEMP_MIN, TEMP_MAX);
-    LOG_INF("Humidity range: %d-%d%%", HUMIDITY_MIN, HUMIDITY_MAX);
-    LOG_INF("==========================================");
-    
-    while (1) {
-        k_msleep(5000);
-        LOG_INF("System running - Queues: Input[%d] Output[%d]", 
-                k_msgq_num_used_get(&input_queue),
-                k_msgq_num_used_get(&output_queue));
-    }
-    
-    return 0;
+	k_sleep(K_SECONDS(2));
+
+	error = zsock_getaddrinfo(CONFIG_SNTP_HOSTNAME, "123", &hints, &res);
+	if (error) {
+		LOG_ERR("Failed to get hostname info");
+		return -1;
+	} else {
+		net_addr_ntop(AF_INET, res->ai_addr, ipbuf, sizeof(ipbuf));
+
+		LOG_INF("DNS SNTP OK: %s -> %s", ipbuf, CONFIG_SNTP_HOSTNAME);
+
+		sntp_endpoint.len = res->ai_addrlen;
+		memcpy(&sntp_endpoint.addr, res->ai_addr, res->ai_addrlen);
+
+		zsock_freeaddrinfo(res);
+	}
+
+	k_thread_create(&thread_sntp_data, thread_sntp_stack,
+			K_THREAD_STACK_SIZEOF(thread_sntp_stack), sntp_thread, &sntp_endpoint, NULL,
+			NULL, K_PRIO_PREEMPT(4), 0, K_NO_WAIT);
+
+	k_thread_create(&thread_logger_data, thread_logger_stack,
+			K_THREAD_STACK_SIZEOF(thread_logger_stack), logger_thread, NULL, NULL, NULL,
+			K_PRIO_PREEMPT(3), 0, K_NO_WAIT);
+
+	k_thread_create(&thread_app_data, thread_app_stack, K_THREAD_STACK_SIZEOF(thread_app_stack),
+			app_thread, NULL, NULL, NULL, K_PRIO_PREEMPT(3), 0, K_NO_WAIT);
+
+	LOG_INF("System started successfully");
+
+	return 0;
 }

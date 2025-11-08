@@ -1,37 +1,26 @@
-# SNTP Time Synchronization Configuration
+source "Kconfig.zephyr"
 
-config SNTP_SERVER
-    string "SNTP Server Address"
-    default "pool.ntp.org"
-    help
-      Hostname or IP address of the SNTP server to synchronize with.
-      Default is pool.ntp.org which provides a pool of NTP servers.
+menu "Hello Timer Configuration"
+
+config SNTP_HOSTNAME
+  string "Hostname for SNTP Server"
+  help
+    Sets the SNTP Server Hostname
 
 config WIFI_SSID
-    string "WiFi SSID"
-    default "MyWiFi"
-    help
-      SSID of the WiFi network to connect to.
+  string "SSID Wi-Fi connection"
+  help
+    Sets WiFi SSID
 
-config WIFI_PASSWORD
-    string "WiFi Password"
-    default "password123"
+config WIFI_PASSWD
+  string "Password Wi-Fi connection"
     help
-      Password for the WiFi network.
+      Sets WiFi password
 
-# Additional networking configurations
-config WIFI_CONNECT_TIMEOUT
-    int "WiFi connection timeout (ms)"
-    default 30000
+config LOCAL_TIME
+  int "Locale time converter offset"
+  default 0
     help
-      Maximum time to wait for WiFi connection in milliseconds.
+      Sets Locale time converter like: -3 or +3
 
-config SNTP_SYNC_INTERVAL
-    int "SNTP sync interval (seconds)"
-    default 60
-    help
-      Interval between SNTP synchronization requests in seconds.
-
-menu "Zephyr"
-source "Kconfig.zephyr"
 endmenu
