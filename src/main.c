@@ -13,6 +13,9 @@
 #include <zephyr/toolchain.h>
 #include <zephyr/zbus/zbus.h>
 
+// tentei fazer com  uma rasp zero mas nao tava conseguindo, acabei optando pela esp 32 devkit
+
+
 LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 
 #include "wifi_connect.h"
